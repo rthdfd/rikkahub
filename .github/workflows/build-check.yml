@@ -109,3 +109,11 @@ jobs:
         run: |
           chmod +x gradlew
           ./gradlew assembleDebug --stacktrace
+
+      # 上传 Debug APK，可在 Actions 页面直接下载（或通过 nightly.link 免登录下载）
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error

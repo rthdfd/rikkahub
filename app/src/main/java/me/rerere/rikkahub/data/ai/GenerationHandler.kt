@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.flow
@@ -68,6 +69,12 @@ class GenerationHandler(
     private val json: Json,
     private val memoryRepo: MemoryRepository,
 ) {
+    companion object {
+        // 自动重试: 报错后间隔 3s/15s/30s 重试, 最多 3 次, 3 次全失败后抛出错误
+        private val AUTO_RETRY_DELAYS = longArrayOf(3_000L, 15_000L, 30_000L)
+        private const val AUTO_RETRY_MAX = 3
+    }
+
     fun generateText(
         settings: Settings,
         model: Model,
@@ -416,22 +423,50 @@ class GenerationHandler(
             }
         )
         if (stream) {
-            providerImpl.streamText(
-                providerSetting = provider,
-                messages = internalMessages,
-                params = params
-            ).collect {
-                messages = messages.handleMessageChunk(chunk = it, model = model)
-                it.usage?.let { usage ->
-                    messages = messages.mapIndexed { index, message ->
-                        if (index == messages.lastIndex) {
-                            message.copy(usage = message.usage.merge(usage))
-                        } else {
-                            message
+            // 自动重试: 报错后间隔 3s/15s/30s 重试, 最多 3 次, 3 次全失败则抛出错误
+            // 重试不重置 AI 进度: 已生成的内容(含半截回复)保留, 作为上下文继续
+            var retryCount = 0
+            var requestMessages: List<UIMessage> = internalMessages
+            while (true) {
+                try {
+                    providerImpl.streamText(
+                        providerSetting = provider,
+                        messages = requestMessages,
+                        params = params
+                    ).collect {
+                        messages = messages.handleMessageChunk(chunk = it, model = model)
+                        it.usage?.let { usage ->
+                            messages = messages.mapIndexed { index, message ->
+                                if (index == messages.lastIndex) {
+                                    message.copy(usage = message.usage.merge(usage))
+                                } else {
+                                    message
+                                }
+                            }
+                        }
+                        onUpdateMessages(messages)
+                    }
+                    break
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    if (retryCount >= AUTO_RETRY_MAX) {
+                        Log.e(TAG, "streamText 自动重试 $AUTO_RETRY_MAX 次后仍失败: ${e.message}")
+                        throw e
+                    }
+                    retryCount++
+                    val retryDelay = AUTO_RETRY_DELAYS[retryCount - 1]
+                    Log.w(TAG, "streamText 失败, ${retryDelay / 1000}s 后进行第 $retryCount 次自动重试: ${e.message}")
+                    delay(retryDelay)
+                    // 不重置进度: 用已生成的消息(含半截回复)作为重试上下文续写;
+                    // Claude 要求对话以 user 消息结尾, 末尾补一条临时的"请继续"(仅用于请求, 不写入历史)
+                    requestMessages = messages
+                    if (provider is ProviderSetting.Claude) {
+                        val last = messages.lastOrNull()
+                        if (last?.role == MessageRole.ASSISTANT) {
+                            requestMessages = messages + UIMessage.user("请继续完成你的回复")
                         }
                     }
                 }
-                onUpdateMessages(messages)
             }
         } else {
             val chunk = providerImpl.generateText(
